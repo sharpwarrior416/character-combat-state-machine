@@ -1,21 +1,13 @@
 using UdonSharp;
 using UnityEngine;
 using VRC.Udon;
+using VRC.SDKBase;
 
 public enum CharacterCombatState
 {
     Idle,
     SwordCombat,
     GreatbowAiming
-}
-
-public enum AttackType
-{
-    None,
-    SwordSlash,
-    SwordThrust,
-    BowDraw,
-    BowRelease
 }
 
 [UdonBehaviourSyncMode(BehaviourSyncMode.Continuous)]
@@ -25,192 +17,243 @@ public class CharacterCombatStateMachine : UdonSharpBehaviour
     [UdonSynced]
     public CharacterCombatState currentState = CharacterCombatState.Idle;
 
+    [Header("VRChat Avatar")]
+    public Animator characterAnimator;
+    public VRCPlayerApi localPlayer;
+    public CharacterController characterController;
+
     [Header("Input")]
     public KeyCode weaponSwitchKey = KeyCode.Q;
     public KeyCode attackKey = KeyCode.Mouse0;
     public KeyCode secondaryAttackKey = KeyCode.Mouse1;
-    private float weaponSwitchCooldown = 0.3f;
+
+    private float weaponSwitchCooldown = 0.25f;
     private float lastWeaponSwitchTime = 0f;
 
-    [Header("Animator")]
-    public Animator characterAnimator;
+    [Header("Animator Parameters")]
     public string stateParameterName = "CombatState";
     public string weaponTypeParameterName = "WeaponType";
-    public string attackTriggerName = "Attack";
-    public string secondaryAttackTriggerName = "SecondaryAttack";
+    public string drawProgressParameterName = "DrawProgress";
+    public string isMovingParameterName = "IsMoving";
+    public string velocityXParameterName = "VelocityX";
+    public string velocityYParameterName = "VelocityY";
+    public string isGroundedParameterName = "IsGrounded";
+    public string isAimedParameterName = "IsAimed";
 
-    [Header("Weapon Visuals")]
+    [Header("Combat Visuals")]
     public GameObject swordVisual;
     public GameObject greatbowVisual;
     public GameObject arrowVisual;
 
-    [Header("Sword Combat Settings")]
+    [Header("Sword Settings")]
+    public float swordDamage = 20f;
+    public float swordRange = 2.4f;
     public float swordSlashCooldown = 0.6f;
     public float swordThrustCooldown = 0.8f;
-    public float swordDamage = 15f;
-    public float swordRange = 2.5f;
     public Transform swordAttackPoint;
     private float lastSwordAttackTime = 0f;
-    private AttackType lastSwordAttackType = AttackType.None;
 
-    [Header("Bow Combat Settings")]
+    [Header("Bow Settings")]
     public float bowDrawDuration = 1.2f;
-    public float bowReleaseDamage = 25f;
-    public float bowRange = 50f;
+    public float bowReleaseDamage = 30f;
+    public float bowRange = 40f;
     public Transform bowAimPoint;
     public Transform arrowSpawnPoint;
+    public float bowAimHeadLookInfluence = 0.7f;
+
     private float bowDrawStartTime = 0f;
     private bool isBowDrawing = false;
-    private float drawProgress = 0f; // 0 to 1
+    private float drawProgress = 0f;
 
     [Header("Audio")]
+    public AudioSource audioSource;
+    public AudioClip weaponSwitchSFX;
     public AudioClip swordSlashSFX;
     public AudioClip swordThrustSFX;
     public AudioClip bowDrawSFX;
     public AudioClip bowReleaseSFX;
-    public AudioClip weaponSwitchSFX;
-    private AudioSource audioSource;
 
     [Header("Effects")]
-    public ParticleSystem swordSlashEffect;
-    public ParticleSystem swordThrustEffect;
-    public ParticleSystem bowReleaseEffect;
-    public ParticleSystem hitEffect;
+    public ParticleSystem swordSlashFX;
+    public ParticleSystem swordThrustFX;
+    public ParticleSystem bowReleaseFX;
+    public ParticleSystem hitFX;
 
-    [Header("VRC Settings")]
-    public bool syncStateAcrossNetwork = true;
-    public LayerMask damageLayerMask;
+    [Header("Damage")]
+    public LayerMask damageMask;
 
-    private CharacterCombatState previousState;
-    private bool canAttack = true;
+    [Header("Locomotion Settings")]
+    public bool restrictMovementInBowAim = true;
+    public float bowAimMovementSpeedMultiplier = 0.3f;
+    public bool disableJumpInCombat = false;
+
+    private Vector3 previousAnimatorPosition;
+    private bool isMoving = false;
+    private Vector3 currentMovementDirection = Vector3.zero;
 
     private void Start()
     {
-        // Cache the animator if not assigned
+        localPlayer = Networking.LocalPlayer;
+
         if (characterAnimator == null)
-        {
             characterAnimator = GetComponent<Animator>();
-        }
 
-        // Try to get or create AudioSource
-        audioSource = GetComponent<AudioSource>();
+        if (characterController == null)
+            characterController = GetComponent<CharacterController>();
+
         if (audioSource == null)
-        {
+            audioSource = GetComponent<AudioSource>();
+
+        if (audioSource == null)
             audioSource = gameObject.AddComponent<AudioSource>();
-        }
 
-        if (damageLayerMask == 0)
-        {
-            damageLayerMask = LayerMask.GetMask("Default");
-        }
+        if (damageMask == 0)
+            damageMask = LayerMask.GetMask("Default");
 
-        previousState = currentState;
+        previousAnimatorPosition = transform.position;
         ApplyState(currentState, true);
     }
 
     private void Update()
     {
-        // Only allow local input
-        if (!Networking.IsOwner(gameObject))
+        if (localPlayer == null || !Networking.IsOwner(gameObject))
             return;
 
-        // Check for weapon switch input with cooldown
+        // Update locomotion parameters
+        UpdateLocomotionParameters();
+
+        // Handle weapon switch input
         if (Input.GetKeyDown(weaponSwitchKey))
         {
             if (Time.time >= lastWeaponSwitchTime + weaponSwitchCooldown)
             {
                 lastWeaponSwitchTime = Time.time;
-                RequestCycleState();
+                CycleState();
             }
         }
 
         // Handle combat input based on current state
-        HandleCombatInput();
-
-        // Update bow draw progress if aiming
-        if (isBowDrawing && currentState == CharacterCombatState.GreatbowAiming)
-        {
-            UpdateBowDrawProgress();
-        }
-    }
-
-    private void HandleCombatInput()
-    {
         switch (currentState)
         {
+            case CharacterCombatState.Idle:
+                break;
+
             case CharacterCombatState.SwordCombat:
                 HandleSwordInput();
                 break;
 
             case CharacterCombatState.GreatbowAiming:
                 HandleBowInput();
+                HandleBowAim();
                 break;
+        }
 
-            case CharacterCombatState.Idle:
-                // No combat in idle
-                break;
+        // Update bow draw progress
+        if (isBowDrawing && currentState == CharacterCombatState.GreatbowAiming)
+        {
+            UpdateBowDrawProgress();
+        }
+    }
+
+    private void UpdateLocomotionParameters()
+    {
+        if (characterAnimator == null)
+            return;
+
+        // Detect movement from animator position change
+        Vector3 displacement = transform.position - previousAnimatorPosition;
+        float speed = displacement.magnitude / Time.deltaTime;
+        isMoving = speed > 0.1f;
+
+        // Calculate velocity in local space for blending
+        Vector3 localVelocity = transform.worldToLocalMatrix.MultiplyVector(displacement / Time.deltaTime);
+        float velocityX = localVelocity.x;
+        float velocityY = localVelocity.z; // Forward/backward
+
+        // Check if grounded (simplified - can be improved with raycasts)
+        bool isGrounded = characterController != null ? characterController.isGrounded : true;
+
+        // Apply movement restrictions based on combat state
+        if (currentState == CharacterCombatState.GreatbowAiming && restrictMovementInBowAim)
+        {
+            velocityX *= bowAimMovementSpeedMultiplier;
+            velocityY *= bowAimMovementSpeedMultiplier;
+        }
+
+        // Update animator
+        characterAnimator.SetBool(isMovingParameterName, isMoving);
+        characterAnimator.SetFloat(velocityXParameterName, velocityX);
+        characterAnimator.SetFloat(velocityYParameterName, velocityY);
+        characterAnimator.SetBool(isGroundedParameterName, isGrounded);
+        characterAnimator.SetBool(isAimedParameterName, isBowDrawing);
+
+        previousAnimatorPosition = transform.position;
+    }
+
+    private void HandleBowAim()
+    {
+        if (!isBowDrawing || bowAimPoint == null)
+            return;
+
+        // Point bow aim direction at camera look direction
+        // This integrates with VRChat's head tracking
+        Vector3 cameraForward = characterAnimator.GetBoneTransform(HumanBodyBones.Head).forward;
+        bowAimPoint.rotation = Quaternion.LookRotation(cameraForward);
+
+        // Optional: Adjust character upper body to face aim direction
+        if (characterAnimator != null && bowAimHeadLookInfluence > 0f)
+        {
+            // This is handled through animator IK in your animator layer
+            // The IK weight is controlled by the "IsAimed" parameter
         }
     }
 
     private void HandleSwordInput()
     {
-        // Primary attack: Slash
         if (Input.GetKeyDown(attackKey))
         {
             if (Time.time >= lastSwordAttackTime + swordSlashCooldown)
             {
-                RequestSwordAttack(AttackType.SwordSlash);
+                lastSwordAttackTime = Time.time;
+                ExecuteSwordSlash();
             }
         }
 
-        // Secondary attack: Thrust
         if (Input.GetKeyDown(secondaryAttackKey))
         {
             if (Time.time >= lastSwordAttackTime + swordThrustCooldown)
             {
-                RequestSwordAttack(AttackType.SwordThrust);
+                lastSwordAttackTime = Time.time;
+                ExecuteSwordThrust();
             }
         }
     }
 
     private void HandleBowInput()
     {
-        // Start drawing bow on primary attack
         if (Input.GetKeyDown(attackKey) && !isBowDrawing)
         {
             StartBowDraw();
         }
 
-        // Release arrow when button is released or secondary attack pressed
         if ((Input.GetKeyUp(attackKey) || Input.GetKeyDown(secondaryAttackKey)) && isBowDrawing)
         {
-            ReleaseBowArrow();
-        }
-    }
-
-    public void RequestCycleState()
-    {
-        if (syncStateAcrossNetwork)
-        {
-            SendCustomNetworkEvent(VRC.Udon.Common.Interfaces.NetworkEventTarget.AllBuffered, nameof(CycleState));
-        }
-        else
-        {
-            CycleState();
+            ReleaseBow();
         }
     }
 
     public void CycleState()
     {
-        // Cancel any ongoing attacks when switching states
+        // Cancel ongoing bow draw when switching states
         if (isBowDrawing)
         {
             isBowDrawing = false;
+            drawProgress = 0f;
             if (arrowVisual != null)
                 arrowVisual.SetActive(false);
+            if (characterAnimator != null)
+                characterAnimator.SetFloat(drawProgressParameterName, 0f);
         }
-
-        previousState = currentState;
 
         switch (currentState)
         {
@@ -234,32 +277,13 @@ public class CharacterCombatStateMachine : UdonSharpBehaviour
     {
         currentState = newState;
 
-        // Update Animator Parameters
-        UpdateAnimator(newState);
-
-        // Update Weapon Visuals
-        UpdateWeaponVisuals(newState);
-
-        // Play Audio
-        if (!isInitializing && weaponSwitchSFX != null)
-        {
-            audioSource.PlayOneShot(weaponSwitchSFX);
-        }
-
-        // Debug Log
-        Debug.Log($"[Combat State Machine] Switched to: {newState}");
-    }
-
-    private void UpdateAnimator(CharacterCombatState newState)
-    {
         if (characterAnimator == null)
             return;
 
-        // Set the state parameter (integer value 0, 1, 2)
-        int stateValue = (int)newState;
-        characterAnimator.SetInteger(stateParameterName, stateValue);
+        // Update combat state parameter
+        characterAnimator.SetInteger(stateParameterName, (int)newState);
 
-        // Also set weapon type for more granular control
+        // Update weapon type parameter
         switch (newState)
         {
             case CharacterCombatState.Idle:
@@ -274,92 +298,63 @@ public class CharacterCombatStateMachine : UdonSharpBehaviour
                 characterAnimator.SetInteger(weaponTypeParameterName, 2); // Bow
                 break;
         }
-    }
 
-    private void UpdateWeaponVisuals(CharacterCombatState newState)
-    {
-        // Disable all weapons first
+        // Update weapon visuals
         if (swordVisual != null)
-            swordVisual.SetActive(false);
+            swordVisual.SetActive(newState == CharacterCombatState.SwordCombat);
 
         if (greatbowVisual != null)
-            greatbowVisual.SetActive(false);
+            greatbowVisual.SetActive(newState == CharacterCombatState.GreatbowAiming);
 
         if (arrowVisual != null)
             arrowVisual.SetActive(false);
 
-        // Enable the appropriate weapon
-        switch (newState)
-        {
-            case CharacterCombatState.Idle:
-                // No weapon active in Idle state
-                break;
+        // Play weapon switch sound
+        if (!isInitializing && weaponSwitchSFX != null && audioSource != null)
+            audioSource.PlayOneShot(weaponSwitchSFX);
 
-            case CharacterCombatState.SwordCombat:
-                if (swordVisual != null)
-                    swordVisual.SetActive(true);
-                break;
+        // Reset locomotion parameters for new state
+        characterAnimator.SetFloat(drawProgressParameterName, 0f);
+        characterAnimator.SetBool(isAimedParameterName, false);
 
-            case CharacterCombatState.GreatbowAiming:
-                if (greatbowVisual != null)
-                    greatbowVisual.SetActive(true);
-                break;
-        }
+        Debug.Log($"[Combat State] Switched to: {newState}");
     }
 
     // ============== SWORD COMBAT ==============
 
-    public void RequestSwordAttack(AttackType attackType)
+    private void ExecuteSwordSlash()
     {
-        if (syncStateAcrossNetwork)
-        {
-            SendCustomNetworkEvent(VRC.Udon.Common.Interfaces.NetworkEventTarget.AllBuffered, nameof(ExecuteSwordAttack));
-        }
-        else
-        {
-            ExecuteSwordAttack();
-        }
-
-        lastSwordAttackType = attackType;
-        lastSwordAttackTime = Time.time;
-    }
-
-    public void ExecuteSwordAttack()
-    {
-        if (currentState != CharacterCombatState.SwordCombat)
-            return;
-
-        // Determine attack type based on time since last attack
-        AttackType attackType = lastSwordAttackType;
-        string animTrigger = (attackType == AttackType.SwordSlash) ? "SwordSlash" : "SwordThrust";
-        AudioClip sfx = (attackType == AttackType.SwordSlash) ? swordSlashSFX : swordThrustSFX;
-        ParticleSystem effect = (attackType == AttackType.SwordSlash) ? swordSlashEffect : swordThrustEffect;
-
-        // Play animation
         if (characterAnimator != null)
-        {
-            characterAnimator.SetTrigger(animTrigger);
-        }
+            characterAnimator.SetTrigger("SwordSlash");
 
-        // Play sound
-        if (sfx != null && audioSource != null)
-        {
-            audioSource.PlayOneShot(sfx);
-        }
+        if (swordSlashSFX != null && audioSource != null)
+            audioSource.PlayOneShot(swordSlashSFX);
 
-        // Play effect
-        if (effect != null)
-        {
-            effect.Play();
-        }
+        if (swordSlashFX != null)
+            swordSlashFX.Play();
 
-        // Perform damage check
-        PerformSwordDamage(attackType);
+        DealSwordDamage(1.0f);
 
-        Debug.Log($"[Sword Attack] {attackType} executed!");
+        Debug.Log("[Sword] Slash executed!");
     }
 
-    private void PerformSwordDamage(AttackType attackType)
+    private void ExecuteSwordThrust()
+    {
+        if (characterAnimator != null)
+            characterAnimator.SetTrigger("SwordThrust");
+
+        if (swordThrustSFX != null && audioSource != null)
+            audioSource.PlayOneShot(swordThrustSFX);
+
+        if (swordThrustFX != null)
+            swordThrustFX.Play();
+
+        DealSwordDamage(1.35f);
+
+        Debug.Log("[Sword] Thrust executed!");
+    }
+
+    private void DealSwordDamage(float multiplier)
     {
         if (swordAttackPoint == null)
         {
@@ -367,29 +362,27 @@ public class CharacterCombatStateMachine : UdonSharpBehaviour
             return;
         }
 
-        // Raycast or sphere cast to detect enemies
-        Collider[] hitColliders = Physics.OverlapSphere(swordAttackPoint.position, swordRange, damageLayerMask);
+        Collider[] hits = Physics.OverlapSphere(swordAttackPoint.position, swordRange * multiplier, damageMask);
 
-        foreach (Collider hitCollider in hitColliders)
+        foreach (Collider col in hits)
         {
-            // Skip self
-            if (hitCollider.gameObject == gameObject)
+            if (col.gameObject == gameObject)
                 continue;
 
-            // Try to get the character controller or health component
-            UdonBehaviour targetBehaviour = hitCollider.GetComponent<UdonBehaviour>();
-            CharacterHealth targetHealth = hitCollider.GetComponent<CharacterHealth>();
-
-            if (targetHealth != null)
+            CharacterHealth health = col.GetComponent<CharacterHealth>();
+            if (health != null)
             {
-                targetHealth.TakeDamage(swordDamage, gameObject);
-                Debug.Log($"[Damage] Dealt {swordDamage} sword damage to {hitCollider.gameObject.name}");
+                float finalDamage = swordDamage * multiplier;
+                health.TakeDamage(finalDamage, gameObject);
 
-                // Play hit effect
-                if (hitEffect != null)
+                if (hitFX != null)
                 {
-                    Instantiate(hitEffect, hitCollider.transform.position, Quaternion.identity);
+                    ParticleSystem fx = Instantiate(hitFX, col.transform.position, Quaternion.identity);
+                    fx.Play();
+                    Destroy(fx.gameObject, 3f);
                 }
+
+                Debug.Log($"[Damage] Dealt {finalDamage} sword damage to {col.gameObject.name}");
             }
         }
     }
@@ -402,25 +395,19 @@ public class CharacterCombatStateMachine : UdonSharpBehaviour
         bowDrawStartTime = Time.time;
         drawProgress = 0f;
 
-        // Show arrow
         if (arrowVisual != null)
-        {
             arrowVisual.SetActive(true);
-        }
 
-        // Play draw sound
         if (bowDrawSFX != null && audioSource != null)
-        {
             audioSource.PlayOneShot(bowDrawSFX);
-        }
 
-        // Play draw animation
         if (characterAnimator != null)
         {
             characterAnimator.SetTrigger("BowDraw");
+            characterAnimator.SetBool(isAimedParameterName, true);
         }
 
-        Debug.Log("[Bow] Started drawing...");
+        Debug.Log("[Bow] Draw started...");
     }
 
     private void UpdateBowDrawProgress()
@@ -428,63 +415,50 @@ public class CharacterCombatStateMachine : UdonSharpBehaviour
         float elapsedTime = Time.time - bowDrawStartTime;
         drawProgress = Mathf.Clamp01(elapsedTime / bowDrawDuration);
 
-        // Update animator with draw progress
         if (characterAnimator != null)
-        {
-            characterAnimator.SetFloat("DrawProgress", drawProgress);
-        }
+            characterAnimator.SetFloat(drawProgressParameterName, drawProgress);
 
         // Visual feedback: scale arrow based on draw progress
         if (arrowVisual != null)
         {
             Vector3 scale = arrowVisual.transform.localScale;
-            scale.z = 0.5f + (drawProgress * 0.5f); // Scale from 0.5 to 1.0
+            scale.z = 0.5f + (drawProgress * 0.5f);
             arrowVisual.transform.localScale = scale;
         }
     }
 
-    private void ReleaseBowArrow()
+    private void ReleaseBow()
     {
         if (!isBowDrawing)
             return;
 
         isBowDrawing = false;
 
-        // Calculate damage based on draw progress
-        float damageMultiplier = Mathf.Lerp(0.3f, 1.0f, drawProgress);
-        float finalDamage = bowReleaseDamage * damageMultiplier;
-
-        // Play release sound
-        if (bowReleaseSFX != null && audioSource != null)
-        {
-            audioSource.PlayOneShot(bowReleaseSFX);
-        }
-
-        // Play release animation
         if (characterAnimator != null)
         {
+            characterAnimator.SetBool(isAimedParameterName, false);
             characterAnimator.SetTrigger("BowRelease");
         }
 
-        // Play effect
-        if (bowReleaseEffect != null)
-        {
-            bowReleaseEffect.Play();
-        }
+        if (bowReleaseSFX != null && audioSource != null)
+            audioSource.PlayOneShot(bowReleaseSFX);
 
-        // Fire the arrow
-        FireArrow(finalDamage, drawProgress);
+        if (bowReleaseFX != null)
+            bowReleaseFX.Play();
 
-        // Hide arrow
+        FireArrow(drawProgress);
+
         if (arrowVisual != null)
-        {
             arrowVisual.SetActive(false);
-        }
 
-        Debug.Log($"[Bow] Released arrow with {drawProgress * 100}% power, damage: {finalDamage}");
+        drawProgress = 0f;
+        if (characterAnimator != null)
+            characterAnimator.SetFloat(drawProgressParameterName, 0f);
+
+        Debug.Log($"[Bow] Released with {drawProgress * 100}% power!");
     }
 
-    private void FireArrow(float damage, float drawStrength)
+    private void FireArrow(float power)
     {
         if (arrowSpawnPoint == null)
         {
@@ -492,48 +466,34 @@ public class CharacterCombatStateMachine : UdonSharpBehaviour
             return;
         }
 
-        // Raycast in the direction the bow is aiming
-        Vector3 rayDirection = arrowSpawnPoint.forward;
-        float distance = bowRange * Mathf.Lerp(0.5f, 1.0f, drawStrength);
+        Vector3 origin = arrowSpawnPoint.position;
+        Vector3 direction = arrowSpawnPoint.forward;
 
-        RaycastHit[] hits = Physics.RaycastAll(arrowSpawnPoint.position, rayDirection, distance, damageLayerMask);
-
-        // Sort by distance and hit the closest target
-        if (hits.Length > 0)
+        RaycastHit hit;
+        if (Physics.Raycast(origin, direction, out hit, bowRange, damageMask))
         {
-            RaycastHit closestHit = hits[0];
-            float closestDistance = closestHit.distance;
+            if (hit.collider.gameObject == gameObject)
+                return;
 
-            foreach (RaycastHit hit in hits)
+            CharacterHealth health = hit.collider.GetComponent<CharacterHealth>();
+            if (health != null)
             {
-                if (hit.distance < closestDistance && hit.collider.gameObject != gameObject)
+                float finalDamage = bowReleaseDamage * Mathf.Lerp(0.5f, 1.0f, power);
+                health.TakeDamage(finalDamage, gameObject);
+
+                if (hitFX != null)
                 {
-                    closestHit = hit;
-                    closestDistance = hit.distance;
+                    ParticleSystem fx = Instantiate(hitFX, hit.point, Quaternion.LookRotation(hit.normal));
+                    fx.Play();
+                    Destroy(fx.gameObject, 3f);
                 }
-            }
 
-            // Apply damage
-            if (closestHit.collider.gameObject != gameObject)
-            {
-                CharacterHealth targetHealth = closestHit.collider.GetComponent<CharacterHealth>();
-
-                if (targetHealth != null)
-                {
-                    targetHealth.TakeDamage(damage, gameObject);
-                    Debug.Log($"[Damage] Dealt {damage} arrow damage to {closestHit.collider.gameObject.name}");
-
-                    // Play hit effect at impact point
-                    if (hitEffect != null)
-                    {
-                        Instantiate(hitEffect, closestHit.point, Quaternion.identity);
-                    }
-                }
+                Debug.Log($"[Damage] Dealt {finalDamage} arrow damage to {hit.collider.gameObject.name}");
             }
         }
     }
 
-    // ============== STATE QUERIES ==============
+    // ============== PUBLIC QUERY METHODS ==============
 
     public bool IsInState(CharacterCombatState state)
     {
@@ -543,6 +503,11 @@ public class CharacterCombatStateMachine : UdonSharpBehaviour
     public bool CanAttack()
     {
         return currentState == CharacterCombatState.SwordCombat || currentState == CharacterCombatState.GreatbowAiming;
+    }
+
+    public bool IsInCombat()
+    {
+        return currentState != CharacterCombatState.Idle;
     }
 
     public CharacterCombatState GetCurrentState()
@@ -560,27 +525,13 @@ public class CharacterCombatStateMachine : UdonSharpBehaviour
         return isBowDrawing;
     }
 
-    public void SetStateDirectly(CharacterCombatState newState)
+    public bool IsMovingInCombat()
     {
-        if (Networking.IsOwner(gameObject))
-        {
-            previousState = currentState;
-            currentState = newState;
-            ApplyState(newState, false);
-
-            if (syncStateAcrossNetwork)
-            {
-                SendCustomNetworkEvent(VRC.Udon.Common.Interfaces.NetworkEventTarget.AllBuffered, nameof(OnNetworkStateUpdate));
-            }
-        }
+        return isMoving;
     }
 
-    public void OnNetworkStateUpdate()
-    {
-        ApplyState(currentState, false);
-    }
+    // ============== DEBUG VISUALIZATION ==============
 
-    // Helper method to draw gizmos for attack ranges
     private void OnDrawGizmosSelected()
     {
         // Draw sword attack range
@@ -590,11 +541,19 @@ public class CharacterCombatStateMachine : UdonSharpBehaviour
             Gizmos.DrawWireSphere(swordAttackPoint.position, swordRange);
         }
 
-        // Draw bow range
+        // Draw bow aim range
         if (bowAimPoint != null)
         {
             Gizmos.color = Color.cyan;
             Gizmos.DrawLine(bowAimPoint.position, bowAimPoint.position + bowAimPoint.forward * bowRange);
+        }
+
+        // Draw arrow spawn point
+        if (arrowSpawnPoint != null)
+        {
+            Gizmos.color = Color.yellow;
+            Gizmos.DrawSphere(arrowSpawnPoint.position, 0.1f);
+            Gizmos.DrawLine(arrowSpawnPoint.position, arrowSpawnPoint.position + arrowSpawnPoint.forward * 2f);
         }
     }
 }
